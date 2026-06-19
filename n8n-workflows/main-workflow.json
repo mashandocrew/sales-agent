@@ -1,8 +1,622 @@
 {
-  "name": "LinkedIn Agent Main Workflow",
-  "nodes": [],
-  "connections": {},
-  "active": false,
-  "settings": {},
-  "tags": []
+  "name": "LinkedIn Agent — Main Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "linkedin-agent",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "node-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "linkedin-agent-webhook"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "conditions": { "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" }, "combinator": "and", "conditions": [{ "leftValue": "={{ $json.body.action }}", "rightValue": "import", "operator": { "type": "string", "operation": "equals" } }] } },
+            { "conditions": { "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" }, "combinator": "and", "conditions": [{ "leftValue": "={{ $json.body.action }}", "rightValue": "generate", "operator": { "type": "string", "operation": "equals" } }] } },
+            { "conditions": { "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" }, "combinator": "and", "conditions": [{ "leftValue": "={{ $json.body.action }}", "rightValue": "update", "operator": { "type": "string", "operation": "equals" } }] } },
+            { "conditions": { "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" }, "combinator": "and", "conditions": [{ "leftValue": "={{ $json.body.action }}", "rightValue": "full", "operator": { "type": "string", "operation": "equals" } }] } }
+          ]
+        },
+        "fallbackOutput": "extra"
+      },
+      "id": "node-switch",
+      "name": "Switch: action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [460, 300]
+    },
+
+    {
+      "parameters": {
+        "url": "=https://docs.google.com/spreadsheets/d/{{ $vars.SHEET_ID }}/gviz/tq?tqx=out:csv",
+        "options": {}
+      },
+      "id": "node-fetch-sheet",
+      "name": "Fetch Google Sheet",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse CSV and build lead objects\nconst text = $input.first().json.data;\nconst lines = text.replace(/\\r\\n/g,'\\n').replace(/\\r/g,'\\n').split('\\n').filter(l=>l.trim());\n\nfunction parseCSVLine(line) {\n  const fields=[];let i=0;\n  while(i<line.length){\n    if(line[i]==='\"'){let v='';i++;\n      while(i<line.length){if(line[i]==='\\'\"\\'' && line[i+1]==='\"'){v+='\"';i+=2;}else if(line[i]==='\"'){i++;break;}else v+=line[i++];}\n      fields.push(v);if(line[i]===',')i++;\n    }else{const e=line.indexOf(',',i);if(e<0){fields.push(line.slice(i).trim());break;}fields.push(line.slice(i,e).trim());i=e+1;}\n  }\n  return fields;\n}\n\nif(lines.length<2) return [{json:{leads:[],skipped:0,imported:0}}];\n\nconst header=parseCSVLine(lines[0]).map(h=>h.trim());\nconst dataRows=lines.slice(1);\n\n// Fetch existing URLs from Supabase to deduplicate\n// (We'll do this in a separate HTTP Request node)\nconst leads=dataRows.map(line=>{\n  const row=parseCSVLine(line);\n  const obj={};\n  header.forEach((h,i)=>{obj[h]=row[i]?.trim()||null;});\n  return obj;\n}).filter(r=>r.first_name&&r.last_name&&r.linkedin_url);\n\nreturn [{json:{leads,count:leads.length}}];"
+      },
+      "id": "node-parse-csv",
+      "name": "Parse CSV",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [940, 100]
+    },
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/leads?select=linkedin_url",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-get-existing-urls",
+      "name": "Get Existing URLs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1160, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "const parsed = $('Parse CSV').first().json;\nconst existing = $input.all().map(i=>i.json.linkedin_url?.toLowerCase()).filter(Boolean);\nconst existSet = new Set(existing);\n\nconst newLeads = parsed.leads\n  .filter(l => !existSet.has(l.linkedin_url?.toLowerCase()))\n  .map(l => ({\n    first_name:    l.first_name,\n    last_name:     l.last_name,\n    title:         l.title || null,\n    company:       l.company || null,\n    industry:      l.industry || null,\n    location:      l.location || null,\n    linkedin_url:  l.linkedin_url,\n    website:       l.website || null,\n    employee_count:l.employee_count ? parseInt(l.employee_count)||null : null,\n    status:        'NEW',\n    source:        'n8n_sheet',\n    sales_stage:   'PROSPECTADO'\n  }));\n\nreturn [{json:{newLeads,count:newLeads.length,skipped:parsed.leads.length-newLeads.length}}];"
+      },
+      "id": "node-dedup",
+      "name": "Deduplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1380, 100]
+    },
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/leads",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": []
+        },
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.newLeads) }}",
+        "options": {}
+      },
+      "id": "node-insert-leads",
+      "name": "Insert Leads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1600, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Deduplicate').first().json;\nreturn [{json:{success:true,action:'import',imported:d.count,skipped:d.skipped}}];"
+      },
+      "id": "node-import-done",
+      "name": "Import Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1820, 100]
+    },
+
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/leads?status=eq.NEW&order=created_at.asc&limit=20&select=*",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-get-new-leads",
+      "name": "Get NEW Leads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Unwrap leads array into individual items for SplitInBatches\nconst leads = $input.first().json;\nif(!Array.isArray(leads)||leads.length===0) return [{json:{done:true,message:'No NEW leads'}}];\nreturn leads.map(l=>({json:l}));"
+      },
+      "id": "node-split-leads",
+      "name": "Split Leads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [940, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "node-loop-leads",
+      "name": "Loop Leads",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1160, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $vars.GROQ_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"llama-3.3-70b-versatile\",\n  \"temperature\": 0.3,\n  \"max_tokens\": 300,\n  \"messages\": [{\n    \"role\": \"user\",\n    \"content\": \"Sos un analista de ventas B2B experto en el mercado hispano de Estados Unidos y LATAM.\\nAnalizá este prospecto para venderle Pip (soypip.com), una plataforma de automatización de WhatsApp Business.\\n\\nProducto Pip: Chatbot con IA para WhatsApp, CRM conversacional, envíos masivos, plantillas con botones, etiquetas inteligentes, derivaciones automáticas, chat interno, API/Webhooks, analytics.\\n\\nProspecto:\\n- Nombre: {{ $json.first_name }} {{ $json.last_name }}\\n- Cargo: {{ $json.title ?? 'desconocido' }}\\n- Empresa: {{ $json.company ?? 'desconocida' }}\\n- Industria: {{ $json.industry ?? 'desconocida' }}\\n- Ubicación: {{ $json.location ?? 'desconocida' }}\\n- Empleados: {{ $json.employee_count ?? 'desconocido' }}\\n\\nRespondé ÚNICAMENTE con JSON válido. Sin markdown, sin backticks:\\n{\\n  \\\"pain_point\\\": \\\"NO_WHATSAPP_AUTO | CHATBOT_DEFICIENTE | SIN_WHATSAPP | SOPORTE_MANUAL | CRECIMIENTO_SIN_ESCALA\\\",\\n  \\\"relevance_hook\\\": \\\"una oración corta y específica sobre por qué este prospecto necesita automatizar WhatsApp\\\",\\n  \\\"priority_score\\\": 1,\\n  \\\"reasoning\\\": \\\"breve\\\"\\n}\"\n  }]\n}",
+        "options": {}
+      },
+      "id": "node-groq-analysis",
+      "name": "Groq: Analyze Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1380, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const lead = $('Loop Leads').item.json;\nconst raw = $input.first().json.choices[0].message.content.trim();\nlet analysis;\ntry {\n  analysis = JSON.parse(raw.replace(/```json|```/g,'').trim());\n} catch(e) {\n  analysis = {pain_point:'SOPORTE_MANUAL',relevance_hook:'Necesita automatizar WhatsApp',priority_score:5,reasoning:'parse error'};\n}\nreturn [{\n  json: {\n    lead_id: lead.id,\n    first_name: lead.first_name,\n    last_name: lead.last_name,\n    title: lead.title,\n    company: lead.company,\n    industry: lead.industry,\n    location: lead.location,\n    employee_count: lead.employee_count,\n    ...analysis\n  }\n}];"
+      },
+      "id": "node-parse-analysis",
+      "name": "Parse Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1600, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/leads?id=eq.{{ $json.lead_id }}",
+        "method": "PATCH",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"pain_point\":\"{{ $json.pain_point }}\",\"relevance_hook\":\"{{ $json.relevance_hook }}\",\"priority_score\":{{ $json.priority_score }},\"analysis_data\":{{ JSON.stringify({pain_point:$json.pain_point,relevance_hook:$json.relevance_hook,priority_score:$json.priority_score,reasoning:$json.reasoning}) }},\"status\":\"ANALYZED\"}",
+        "options": {}
+      },
+      "id": "node-update-lead-analyzed",
+      "name": "Update Lead ANALYZED",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1820, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/outreach",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"lead_id\":\"{{ $('Parse Analysis').item.json.lead_id }}\",\"current_step\":0,\"next_action\":\"SEND_CONNECTION\",\"next_action_date\":\"{{ $now.toISODate() }}\"}",
+        "options": {}
+      },
+      "id": "node-create-outreach",
+      "name": "Create Outreach",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2040, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the 4 message prompts using lead + analysis data\nconst analysis = $('Parse Analysis').item.json;\nconst outreach = $input.first().json[0];\n\nconst lead = {\n  ...analysis,\n  outreach_id: outreach.id\n};\n\nconst steps = [\n  {\n    step_number: 1,\n    message_type: 'connection_note',\n    max_chars: 300,\n    prompt: `Escribí una nota de conexión de LinkedIn en español para:\\n${lead.first_name} ${lead.last_name}, ${lead.title??'profesional'} en ${lead.company??'su empresa'} (${lead.industry??''}, ${lead.location??''}).\\n\\nCONTEXTO: ${lead.relevance_hook}\\n\\nREGLAS ESTRICTAS:\\n- MÁXIMO 300 caracteres\\n- NO menciones Pip, WhatsApp, automatización, ventas, ni tu empresa\\n- NO uses frases de presentación genéricas\\n- SÍ mencioná algo específico de ${lead.company??'su empresa'}\\n- Usá el nombre: ${lead.first_name}\\n\\nRespondé SOLO con el texto.`\n  },\n  {\n    step_number: 2,\n    message_type: 'linkedin_message',\n    max_chars: 500,\n    prompt: `Escribí un mensaje de LinkedIn en español para ${lead.first_name} ${lead.last_name}, ${lead.title??'profesional'} en ${lead.company??'su empresa'}.\\nYa aceptó tu conexión. Pain point: ${lead.pain_point}. Gancho: ${lead.relevance_hook}.\\nProducto: Pip (soypip.com) automatiza WhatsApp Business.\\nREGLAS: máx 500 chars, agradecé conexión, mencioná dato concreto de su industria, NO pidas reunión.\\nRespondé SOLO con el texto.`\n  },\n  {\n    step_number: 3,\n    message_type: 'linkedin_message',\n    max_chars: 400,\n    prompt: `Escribí un mensaje de LinkedIn en español para ${lead.first_name} de ${lead.company??'su empresa'}.\\nOfrecé enviar video de 30 seg mostrando automatización de WhatsApp en ${lead.industry??'su industria'}.\\nREGLAS: máx 400 chars, pregunta cerrada sí/no, no insistente.\\nRespondé SOLO con el texto.`\n  },\n  {\n    step_number: 4,\n    message_type: 'linkedin_message',\n    max_chars: 250,\n    prompt: `Escribí mensaje de cierre de LinkedIn en español para ${lead.first_name} de ${lead.company??'su empresa'}.\\nREGLAS: máx 250 chars, breve, respetuoso, dejá la puerta abierta.\\nRespondé SOLO con el texto.`\n  }\n];\n\nreturn steps.map(s => ({json:{...s, lead_id: lead.lead_id, outreach_id: lead.outreach_id}}));"
+      },
+      "id": "node-build-prompts",
+      "name": "Build Message Prompts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2260, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "node-loop-steps",
+      "name": "Loop 4 Steps",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [2480, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $vars.GROQ_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"model\":\"llama-3.3-70b-versatile\",\"temperature\":0.7,\"max_tokens\":{{ $json.max_chars + 60 }},\"messages\":[{\"role\":\"user\",\"content\":{{ JSON.stringify($json.prompt) }}}]}",
+        "options": {}
+      },
+      "id": "node-groq-message",
+      "name": "Groq: Generate Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2700, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const step = $('Loop 4 Steps').item.json;\nconst body = $input.first().json.choices[0].message.content.trim().slice(0, step.max_chars);\nreturn [{\n  json: {\n    lead_id: step.lead_id,\n    outreach_id: step.outreach_id,\n    step_number: step.step_number,\n    message_type: step.message_type,\n    body,\n    char_count: body.length,\n    status: 'DRAFT',\n    language: 'es'\n  }\n}];"
+      },
+      "id": "node-trim-message",
+      "name": "Trim Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2920, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/messages",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "node-insert-message",
+      "name": "Insert Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3140, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/leads?id=eq.{{ $('Parse Analysis').item.json.lead_id }}",
+        "method": "PATCH",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"status\":\"ACTIVE\"}",
+        "options": {}
+      },
+      "id": "node-update-lead-active",
+      "name": "Update Lead ACTIVE",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3360, 300]
+    },
+
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/outreach?connection_accepted=eq.true&next_action_date=lte.{{ $now.toISODate() }}&next_action=not.is.null&select=id,lead_id,next_action,next_action_date,current_step",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-get-pending-outreach",
+      "name": "Get Pending Outreach",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 500]
+    },
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/outreach?connection_accepted=eq.false&connection_sent_at=not.is.null&connection_sent_at=lt.{{ DateTime.now().minus({days:7}).toISO() }}&select=id,lead_id",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-get-expired",
+      "name": "Get Expired Connections",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 500]
+    },
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/outreach?current_step=eq.4&step4_sent_at=not.is.null&step4_sent_at=lt.{{ DateTime.now().minus({days:14}).toISO() }}&next_action=neq.COMPLETED&select=id,lead_id",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-get-cold",
+      "name": "Get Cold Sequences",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1160, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const pending  = $('Get Pending Outreach').first().json;\nconst expired  = $('Get Expired Connections').first().json;\nconst cold     = $('Get Cold Sequences').first().json;\n\nconst STEP_MAP = {SEND_STEP_2:2,SEND_STEP_3:3,SEND_STEP_4:4};\nconst pendingList = Array.isArray(pending) ? pending.filter(o=>STEP_MAP[o.next_action]) : [];\nconst expiredList = Array.isArray(expired) ? expired : [];\nconst coldList    = Array.isArray(cold)    ? cold    : [];\n\nreturn [{\n  json: {\n    pending: pendingList,\n    pendingCount: pendingList.length,\n    expired: expiredList,\n    expiredCount: expiredList.length,\n    cold: coldList,\n    coldCount: coldList.length,\n    expiredLeadIds: expiredList.map(o=>o.lead_id),\n    expiredOutreachIds: expiredList.map(o=>o.id),\n    coldLeadIds: coldList.map(o=>o.lead_id),\n    coldOutreachIds: coldList.map(o=>o.id)\n  }\n}];"
+      },
+      "id": "node-calc-updates",
+      "name": "Calculate Updates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1380, 500]
+    },
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/leads?id=in.({{ $json.expiredLeadIds.join(',') }})",
+        "method": "PATCH",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"status\":\"COLD\"}",
+        "options": {}
+      },
+      "id": "node-mark-expired-leads",
+      "name": "Mark Expired Leads COLD",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1600, 500]
+    },
+    {
+      "parameters": {
+        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/leads?id=in.({{ $('Calculate Updates').first().json.coldLeadIds.join(',') }})",
+        "method": "PATCH",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $vars.SUPABASE_ANON_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $vars.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"status\":\"COLD\"}",
+        "options": {}
+      },
+      "id": "node-mark-cold-leads",
+      "name": "Mark Cold Sequences COLD",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1820, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const upd = $('Calculate Updates').first().json;\nreturn [{\n  json: {\n    success: true,\n    action: 'update',\n    pendingMessages: upd.pendingCount,\n    expiredMarked: upd.expiredCount,\n    coldMarked: upd.coldCount\n  }\n}];"
+      },
+      "id": "node-update-done",
+      "name": "Update Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2040, 500]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Trigger import via sub-execution context\n// In n8n, 'full' simply re-fires import branch then generate then update\n// Here we return a signal to the webhook that the full flow started\nreturn [{json:{action:'full',status:'started',message:'Import → Generate → Update sequence initiated. Run each action separately or use n8n sub-workflows for chaining.'}}];"
+      },
+      "id": "node-full",
+      "name": "Full Mode",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 700]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:{error:true,message:`Unknown action: ${$json.body?.action}. Use: import | generate | update | full`}}];"
+      },
+      "id": "node-fallback",
+      "name": "Unknown Action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 900]
+    },
+
+    {
+      "parameters": {
+        "jsCode": "// Merge all branch results into a single response\nconst data = $input.all().map(i=>i.json);\nreturn [{json:{timestamp:new Date().toISOString(),results:data}}];"
+      },
+      "id": "node-respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3600, 300]
+    }
+  ],
+
+  "connections": {
+    "Webhook": {
+      "main": [
+        [{ "node": "Switch: action", "type": "main", "index": 0 }]
+      ]
+    },
+    "Switch: action": {
+      "main": [
+        [{ "node": "Fetch Google Sheet",  "type": "main", "index": 0 }],
+        [{ "node": "Get NEW Leads",        "type": "main", "index": 0 }],
+        [{ "node": "Get Pending Outreach", "type": "main", "index": 0 }],
+        [{ "node": "Full Mode",            "type": "main", "index": 0 }],
+        [{ "node": "Unknown Action",       "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Google Sheet": {
+      "main": [[{ "node": "Parse CSV", "type": "main", "index": 0 }]]
+    },
+    "Parse CSV": {
+      "main": [[{ "node": "Get Existing URLs", "type": "main", "index": 0 }]]
+    },
+    "Get Existing URLs": {
+      "main": [[{ "node": "Deduplicate", "type": "main", "index": 0 }]]
+    },
+    "Deduplicate": {
+      "main": [[{ "node": "Insert Leads", "type": "main", "index": 0 }]]
+    },
+    "Insert Leads": {
+      "main": [[{ "node": "Import Result", "type": "main", "index": 0 }]]
+    },
+    "Get NEW Leads": {
+      "main": [[{ "node": "Split Leads", "type": "main", "index": 0 }]]
+    },
+    "Split Leads": {
+      "main": [[{ "node": "Loop Leads", "type": "main", "index": 0 }]]
+    },
+    "Loop Leads": {
+      "main": [
+        [{ "node": "Groq: Analyze Lead", "type": "main", "index": 0 }],
+        [{ "node": "Respond",            "type": "main", "index": 0 }]
+      ]
+    },
+    "Groq: Analyze Lead": {
+      "main": [[{ "node": "Parse Analysis", "type": "main", "index": 0 }]]
+    },
+    "Parse Analysis": {
+      "main": [[{ "node": "Update Lead ANALYZED", "type": "main", "index": 0 }]]
+    },
+    "Update Lead ANALYZED": {
+      "main": [[{ "node": "Create Outreach", "type": "main", "index": 0 }]]
+    },
+    "Create Outreach": {
+      "main": [[{ "node": "Build Message Prompts", "type": "main", "index": 0 }]]
+    },
+    "Build Message Prompts": {
+      "main": [[{ "node": "Loop 4 Steps", "type": "main", "index": 0 }]]
+    },
+    "Loop 4 Steps": {
+      "main": [
+        [{ "node": "Groq: Generate Message", "type": "main", "index": 0 }],
+        [{ "node": "Update Lead ACTIVE",     "type": "main", "index": 0 }]
+      ]
+    },
+    "Groq: Generate Message": {
+      "main": [[{ "node": "Trim Message", "type": "main", "index": 0 }]]
+    },
+    "Trim Message": {
+      "main": [[{ "node": "Insert Message", "type": "main", "index": 0 }]]
+    },
+    "Insert Message": {
+      "main": [[{ "node": "Loop 4 Steps", "type": "main", "index": 0 }]]
+    },
+    "Update Lead ACTIVE": {
+      "main": [[{ "node": "Loop Leads", "type": "main", "index": 0 }]]
+    },
+    "Get Pending Outreach": {
+      "main": [[{ "node": "Get Expired Connections", "type": "main", "index": 0 }]]
+    },
+    "Get Expired Connections": {
+      "main": [[{ "node": "Get Cold Sequences", "type": "main", "index": 0 }]]
+    },
+    "Get Cold Sequences": {
+      "main": [[{ "node": "Calculate Updates", "type": "main", "index": 0 }]]
+    },
+    "Calculate Updates": {
+      "main": [[{ "node": "Mark Expired Leads COLD", "type": "main", "index": 0 }]]
+    },
+    "Mark Expired Leads COLD": {
+      "main": [[{ "node": "Mark Cold Sequences COLD", "type": "main", "index": 0 }]]
+    },
+    "Mark Cold Sequences COLD": {
+      "main": [[{ "node": "Update Result", "type": "main", "index": 0 }]]
+    }
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+
+  "staticData": null,
+  "tags": ["linkedin-agent", "sales", "automation"],
+
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": ""
+  },
+
+  "pinData": {},
+
+  "versionId": "1.0.0",
+
+  "id": "linkedin-agent-main",
+
+  "_readme": {
+    "setup": "Before importing, set these n8n Variables (Settings > Variables): SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, GROQ_API_KEY, SHEET_ID (the ID from your Google Sheet URL between /d/ and /edit).",
+    "trigger": "POST http://localhost:5678/webhook/linkedin-agent with body: { 'action': 'import' | 'generate' | 'update' | 'full' }",
+    "full_note": "The 'full' action returns a coordination signal. For true chaining, duplicate this workflow and use Execute Workflow nodes, or call run-agent.bat three times: import, generate, update."
+  }
 }
