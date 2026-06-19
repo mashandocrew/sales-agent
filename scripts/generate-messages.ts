@@ -122,7 +122,7 @@ Respondé SOLO con el texto del mensaje.`;
 }
 
 // ── Analysis call with 1 retry ────────────────────────────────────────────────
-async function analyzeLeadWithGroq(
+export async function analyzeLeadWithGroq(
   lead: Record<string, unknown>
 ): Promise<{ pain_point: string; relevance_hook: string; priority_score: number; reasoning: string }> {
   const prompt = analysisPrompt(lead);
@@ -141,9 +141,73 @@ async function analyzeLeadWithGroq(
   throw new Error('unreachable');
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Process a single lead (exported for reuse) ────────────────────────────────
+export type LeadResult = {
+  analysis: { pain_point: string; relevance_hook: string; priority_score: number; reasoning: string };
+  messages: Array<{ step_number: number; body: string; char_count: number }>;
+};
+
+export async function processOneLead(
+  sb: ReturnType<typeof import('@supabase/supabase-js').createClient>,
+  lead: Record<string, unknown>
+): Promise<LeadResult> {
+  const analysis = await analyzeLeadWithGroq(lead);
+  await sleep(2000);
+
+  await sb.from('leads').update({
+    pain_point: analysis.pain_point,
+    relevance_hook: analysis.relevance_hook,
+    priority_score: analysis.priority_score,
+    analysis_data: analysis,
+    status: 'ANALYZED',
+  }).eq('id', lead.id);
+
+  const enrichedLead = { ...lead, ...analysis };
+
+  const today = new Date().toISOString().slice(0, 10);
+  const { data: outreachRow, error: outErr } = await sb
+    .from('outreach')
+    .insert({ lead_id: lead.id, current_step: 0, next_action: 'SEND_CONNECTION', next_action_date: today })
+    .select('id')
+    .single();
+  if (outErr) throw new Error(`outreach insert: ${outErr.message}`);
+  const outreachId = outreachRow.id as string;
+
+  const steps = [
+    { prompt: step1Prompt(enrichedLead), type: 'connection_note',  maxChars: 300 },
+    { prompt: step2Prompt(enrichedLead), type: 'linkedin_message', maxChars: 500 },
+    { prompt: step3Prompt(enrichedLead), type: 'linkedin_message', maxChars: 400 },
+    { prompt: step4Prompt(enrichedLead), type: 'linkedin_message', maxChars: 250 },
+  ];
+
+  const messages: LeadResult['messages'] = [];
+
+  for (let i = 0; i < steps.length; i++) {
+    const { prompt, type, maxChars } = steps[i];
+    const stepNum = i + 1;
+    const body = (await groq(prompt, 0.7, maxChars + 50)).slice(0, maxChars);
+    await sleep(2000);
+
+    await sb.from('messages').insert({
+      lead_id: lead.id,
+      outreach_id: outreachId,
+      step_number: stepNum,
+      message_type: type,
+      language: 'es',
+      body,
+      char_count: body.length,
+      status: 'DRAFT',
+    });
+
+    messages.push({ step_number: stepNum, body, char_count: body.length });
+  }
+
+  await sb.from('leads').update({ status: 'ACTIVE' }).eq('id', lead.id);
+  return { analysis, messages };
+}
+
+// ── Main (batch) ─────────────────────────────────────────────────────────────
 async function generateMessages() {
-  // Register agent run
   const { data: runRow } = await supabase
     .from('agent_runs')
     .insert({ function_name: 'generate-messages', status: 'running' })
@@ -151,7 +215,6 @@ async function generateMessages() {
     .single();
   const runId = runRow?.id as string;
 
-  // Fetch NEW leads
   const { data: leads, error: leadsErr } = await supabase
     .from('leads')
     .select('*')
@@ -159,12 +222,9 @@ async function generateMessages() {
     .order('created_at', { ascending: true })
     .limit(LIMIT);
 
-  if (leadsErr) {
-    console.error('Error al leer leads:', leadsErr.message);
-    process.exit(1);
-  }
+  if (leadsErr) { console.error('Error al leer leads:', leadsErr.message); process.exit(1); }
 
-  if (!leads || leads.length === 0) {
+  if (!leads?.length) {
     console.log('No hay leads con status=NEW.');
     await supabase.from('agent_runs').update({ status: 'completed', finished_at: new Date().toISOString(), leads_processed: 0, messages_generated: 0 }).eq('id', runId);
     return;
@@ -174,99 +234,25 @@ async function generateMessages() {
 
   let totalMessages = 0;
   let totalErrors = 0;
-  let firstLeadSummary: { name: string; score: number; pain: string; step1Preview: string } | null = null;
+  let firstSummary: { name: string; score: number; pain: string; preview: string } | null = null;
 
   for (const lead of leads) {
     const name = `${lead.first_name} ${lead.last_name}`;
     console.log(`→ Analizando: ${name} | ${lead.title ?? ''} @ ${lead.company ?? ''}`);
-
     try {
-      // ── LLAMADA 1: Análisis ──────────────────────────────────────────────
-      const analysis = await analyzeLeadWithGroq(lead);
-      await sleep(2000);
-
-      await supabase.from('leads').update({
-        pain_point: analysis.pain_point,
-        relevance_hook: analysis.relevance_hook,
-        priority_score: analysis.priority_score,
-        analysis_data: analysis,
-        status: 'ANALYZED',
-      }).eq('id', lead.id);
-
-      const enrichedLead = { ...lead, ...analysis };
-      console.log(`   Score: ${analysis.priority_score}/10 | Pain: ${analysis.pain_point}`);
-
-      // ── Crear outreach ───────────────────────────────────────────────────
-      const today = new Date().toISOString().slice(0, 10);
-      const { data: outreachRow, error: outErr } = await supabase
-        .from('outreach')
-        .insert({
-          lead_id: lead.id,
-          current_step: 0,
-          next_action: 'SEND_CONNECTION',
-          next_action_date: today,
-        })
-        .select('id')
-        .single();
-
-      if (outErr) throw new Error(`outreach insert: ${outErr.message}`);
-      const outreachId = outreachRow.id as string;
-
-      // ── LLAMADA 2: Generar 4 mensajes ────────────────────────────────────
-      const steps: { prompt: string; type: string; maxChars: number }[] = [
-        { prompt: step1Prompt(enrichedLead), type: 'connection_note',   maxChars: 300 },
-        { prompt: step2Prompt(enrichedLead), type: 'linkedin_message',  maxChars: 500 },
-        { prompt: step3Prompt(enrichedLead), type: 'linkedin_message',  maxChars: 400 },
-        { prompt: step4Prompt(enrichedLead), type: 'linkedin_message',  maxChars: 250 },
-      ];
-
-      for (let i = 0; i < steps.length; i++) {
-        const { prompt, type, maxChars } = steps[i];
-        const stepNum = i + 1;
-
-        const body = await groq(prompt, 0.7, maxChars + 50);
-        await sleep(2000);
-
-        const truncated = body.slice(0, maxChars);
-
-        await supabase.from('messages').insert({
-          lead_id: lead.id,
-          outreach_id: outreachId,
-          step_number: stepNum,
-          message_type: type,
-          language: 'es',
-          body: truncated,
-          char_count: truncated.length,
-          status: 'DRAFT',
-        });
-
-        totalMessages++;
-
-        if (i === 0 && !firstLeadSummary) {
-          firstLeadSummary = {
-            name,
-            score: analysis.priority_score,
-            pain: analysis.pain_point,
-            step1Preview: truncated,
-          };
-        }
-
-        console.log(`   Paso ${stepNum} (${truncated.length} chars): "${truncated.slice(0, 60)}..."`);
-      }
-
-      // ── Actualizar lead a ACTIVE ─────────────────────────────────────────
-      await supabase.from('leads').update({ status: 'ACTIVE' }).eq('id', lead.id);
+      const result = await processOneLead(supabase, lead);
+      totalMessages += result.messages.length;
+      console.log(`   Score: ${result.analysis.priority_score}/10 | Pain: ${result.analysis.pain_point}`);
+      result.messages.forEach(m => console.log(`   Paso ${m.step_number} (${m.char_count} chars): "${m.body.slice(0, 60)}..."`));
+      if (!firstSummary) firstSummary = { name, score: result.analysis.priority_score, pain: result.analysis.pain_point, preview: result.messages[0]?.body ?? '' };
       console.log(`   ✅ ${name} completado\n`);
-
     } catch (err) {
       totalErrors++;
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`   ❌ Error con ${name}: ${msg}\n`);
-      await supabase.from('leads').update({ status: 'NEW' }).eq('id', lead.id); // revert so it can retry
+      console.error(`   ❌ Error con ${name}: ${err instanceof Error ? err.message : String(err)}\n`);
+      await supabase.from('leads').update({ status: 'NEW' }).eq('id', lead.id);
     }
   }
 
-  // ── Cerrar agent_run ───────────────────────────────────────────────────────
   await supabase.from('agent_runs').update({
     status: totalErrors === leads.length ? 'failed' : 'completed',
     leads_processed: leads.length - totalErrors,
@@ -274,17 +260,18 @@ async function generateMessages() {
     finished_at: new Date().toISOString(),
   }).eq('id', runId);
 
-  // ── Resumen ────────────────────────────────────────────────────────────────
   console.log('─'.repeat(60));
   console.log(`✅ Leads analizados:    ${leads.length - totalErrors}`);
   console.log(`✅ Mensajes generados:  ${totalMessages} (4 por lead)`);
   if (totalErrors > 0) console.log(`❌ Errores:             ${totalErrors}`);
-
-  if (firstLeadSummary) {
+  if (firstSummary) {
     console.log(`\nEjemplo primer lead:`);
-    console.log(`  ${firstLeadSummary.name} | Score: ${firstLeadSummary.score}/10 | Pain: ${firstLeadSummary.pain}`);
-    console.log(`  Paso 1 (${firstLeadSummary.step1Preview.length} chars): "${firstLeadSummary.step1Preview.slice(0, 80)}..."`);
+    console.log(`  ${firstSummary.name} | Score: ${firstSummary.score}/10 | Pain: ${firstSummary.pain}`);
+    console.log(`  Paso 1 (${firstSummary.preview.length} chars): "${firstSummary.preview.slice(0, 80)}..."`);
   }
 }
 
-generateMessages();
+// Only run when invoked directly (not when imported by test-pipeline.ts)
+if (process.argv[1].replace(/\\/g, '/').endsWith('generate-messages.ts')) {
+  generateMessages();
+}
