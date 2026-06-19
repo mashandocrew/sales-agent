@@ -1,0 +1,22 @@
+{
+  "name": "linkedin-agent",
+  "version": "1.0.0",
+  "description": "LinkedIn sales agent with Supabase, Groq and n8n",
+  "scripts": {
+    "seed-config": "tsx scripts/seed-config.ts",
+    "import-leads": "tsx scripts/import-from-sheet.ts",
+    "generate-messages": "tsx scripts/generate-messages.ts",
+    "export-messages": "tsx scripts/export-messages.ts",
+    "update-pipeline": "tsx scripts/update-pipeline.ts",
+    "test-pipeline": "tsx scripts/test-pipeline.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
